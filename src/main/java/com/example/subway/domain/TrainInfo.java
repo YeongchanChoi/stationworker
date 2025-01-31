@@ -15,7 +15,7 @@ public class TrainInfo {
     private Long id;
 
     private String trainNo;        // 열차번호
-    private String upDown;         // 상하선 정보
+    private String upDown;         // 상하선 정보 (SubwayStations의 upDown과 동일)
     private String expressYn;      // 막차 여부
     private String currentStation; // 현재역
     private String endStation;     // 종착역
