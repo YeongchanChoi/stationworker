@@ -25,62 +25,56 @@ public class StationController {
     }
 
     @GetMapping("/api/station/{stationName}")
-    public List<StationTrainResponse> getTrainsPassingStation(
-            @PathVariable("stationName") String stationName) {
-
+    public List<StationTrainResponse> getTrainsPassingStation(@PathVariable("stationName") String stationName) {
         List<TrainInfo> allTrains = trainInfoRepository.findAll();
         List<StationTrainResponse> result = new ArrayList<>();
 
         for (TrainInfo train : allTrains) {
-            // Parse the JSON stations array into a List<String>
+            // JSON 형식의 역 목록을 List<String>으로 파싱
             List<String> path = convertJsonToList(train.getStationsJson());
             if (path == null) {
-                // Parsing error or empty JSON
                 continue;
             }
 
-            // 1) Find the index of the requested station
+            // 요청받은 stationName의 인덱스 확인
             int stationIndex = path.indexOf(stationName);
             if (stationIndex == -1) {
-                // This train does not pass through stationName
                 continue;
             }
 
-            // 2) Find the index of the train’s current station
+            // 현재역의 인덱스 확인
             int currIndex = path.indexOf(train.getCurrentStation());
             if (currIndex == -1) {
-                // Edge case: currentStation not found in stationsJson
                 continue;
             }
 
-            // 3) Calculate remaining stations
             int remainingStations = stationIndex - currIndex;
             if (remainingStations < 0) {
-                // Already passed the station
                 continue;
             }
 
-            // 4) Build the response DTO
+            // lstcarAt을 boolean으로 변환 ("1"이면 true, 그 외에는 false)
+            boolean isLastTrain = "1".equals(train.getLstcarAt());
+
             StationTrainResponse dto = new StationTrainResponse(
                     train.getTrainNo(),
                     train.getUpDown(),
-                    train.getExpressYn(),
+                    isLastTrain,
                     train.getCurrentStation(),
                     train.getEndStation(),
-                    remainingStations
+                    remainingStations,
+                    train.getLineNum()
             );
             result.add(dto);
         }
 
-        // Sort by ascending “remainingStations”
+        // 남은 정거장 수 기준 오름차순 정렬
         result.sort(Comparator.comparingInt(StationTrainResponse::getRemainingStations));
-
         return result;
     }
 
     /**
-     * Helper method to parse a JSON string representing an array of stations
-     * into a List<String> using Jackson.
+     * JSON 문자열을 List<String>으로 변환하는 헬퍼 메서드
      */
     private List<String> convertJsonToList(String json) {
         if (json == null || json.isEmpty()) {

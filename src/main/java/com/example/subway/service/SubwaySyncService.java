@@ -2,13 +2,21 @@ package com.example.subway.service;
 
 import com.example.subway.domain.TrainInfo;
 import com.example.subway.repository.TrainInfoRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.w3c.dom.*;
 import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
+import java.net.URLConnection;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.*;
 
@@ -19,11 +27,13 @@ public class SubwaySyncService {
     private final TrainInfoRepository trainInfoRepository;
     private final SubwayGraphService subwayGraphService;
 
-    // 예시 API 키 (테스트용)
-    private static final String API_KEY = "755455636167793236306850475a51";
-    // swopenAPI: (API_KEY, 노선명) 순서로 URL 구성
+    // 최초 API 키
+    private String apiKey = "755455636167793236306850475a51";
+    // API URL 템플릿
     private static final String SUBWAY_API_URL
             = "http://swopenAPI.seoul.go.kr/api/subway/%s/xml/realtimePosition/0/100/%s";
+    // 로그 기록 파일명
+    private static final String LOG_FILE = "log.json";
 
     public SubwaySyncService(TrainInfoRepository trainInfoRepository,
                              SubwayGraphService subwayGraphService) {
@@ -32,147 +42,218 @@ public class SubwaySyncService {
     }
 
     /**
-     * 지정된 주기로 1~2호선 열차정보를 동기화 (테스트 예시)
-     * 실제로는 1~9호선을 순회하도록 수정 가능
+     * 지정된 주기로 각 호선의 열차정보를 동기화합니다.
      */
     @Scheduled(fixedDelayString = "${myapp.schedule.subway-refresh}")
     public void syncTrains() {
+        Map<String, String> linesToSync = new LinkedHashMap<>();
+
         for (int line = 1; line <= 9; line++) {
-            String lineNum = line + "호선";
+            String lineKey = line + "호선";
+            linesToSync.put(lineKey, lineKey);
+        }
+        linesToSync.put("경강선", "경강선");
+        linesToSync.put("경의중앙선", "경의선");  // API는 "경의중앙선", DB에는 "경의선"으로 저장
+        linesToSync.put("경춘선", "경춘선");
+        linesToSync.put("공항철도", "공항철도");
+        linesToSync.put("서해선", "서해선");
+        linesToSync.put("수인분당선", "수인분당선");
+        linesToSync.put("신분당선", "신분당선");
+        linesToSync.put("신림선", "신림선");
+        linesToSync.put("우이신설선", "우이신설선");
+
+        for (Map.Entry<String, String> entry : linesToSync.entrySet()) {
+            String apiLineName = entry.getKey();
+            String dbLineName  = entry.getValue();
             try {
-                // URL 인코딩
-                String lineNameEncoded = URLEncoder.encode(lineNum, "UTF-8");
-                syncLine(lineNameEncoded, lineNum);
+                String lineNameEncoded = URLEncoder.encode(apiLineName, "UTF-8");
+                syncLine(lineNameEncoded, dbLineName);
             } catch (Exception e) {
-                log.error("Failed to sync line {}: {}", lineNum, e.getMessage(), e);
-            }   
+                log.error("Failed to sync line {}: {}", apiLineName, e.getMessage(), e);
+            }
         }
     }
 
     /**
-     * 특정 호선(lineNameEncoded, lineNum)에 대한 열차정보 동기화 + DB 정리 로직
+     * 특정 호선(lineNameEncoded, lineNum)에 대한 열차정보 동기화 및 DB 정리 로직
      */
     private void syncLine(String lineNameEncoded, String lineNum) throws Exception {
-        // 1) API 호출
-        String apiUrl = String.format(SUBWAY_API_URL, API_KEY, lineNameEncoded);
-        Document doc = DocumentBuilderFactory.newInstance()
-                .newDocumentBuilder()
-                .parse(new URL(apiUrl).openStream());
-        doc.getDocumentElement().normalize();
+        // 인스턴스 변수 apiKey 사용
+        String apiUrl = String.format(SUBWAY_API_URL, apiKey, lineNameEncoded);
+        log.info("[SYNC] {}: API 호출 URL = {}", lineNum, apiUrl);
 
-        NodeList rowList = doc.getElementsByTagName("row");
-        if (rowList.getLength() == 0) {
-            log.info("[INFO] {}: 열차 정보가 없습니다.", lineNum);
-            // 혹시 필요하다면, 여기서 해당 호선의 모든 열차 삭제 로직을 추가해도 됨.
+        URL url = new URL(apiUrl);
+        URLConnection connection = url.openConnection();
+        String contentType = connection.getContentType();
+        InputStream is = connection.getInputStream();
+
+        // JSON 형식 응답 처리
+        if (contentType != null && contentType.contains("application/json")) {
+            String jsonResponse = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> responseMap = mapper.readValue(jsonResponse, new TypeReference<Map<String, Object>>() {});
+            if ("ERROR-337".equals(responseMap.get("code"))) {
+                // 현재 사용중인 API 키에 따라 순차적으로 교체
+                if (this.apiKey.equals("755455636167793236306850475a51")) {
+                    this.apiKey = "51434941476779323635637044786e";
+                } else if (this.apiKey.equals("51434941476779323635637044786e")) {
+                    this.apiKey = "4f6b52794467793236325572567469";
+                }
+                log.warn("[ERROR] {}: {} (API 키를 새 값으로 교체함)", lineNum, jsonResponse);
+                return;
+            }
+            log.info("[INFO] {}: JSON 응답 수신: {}", lineNum, jsonResponse);
             return;
-        }
+        } else {
+            // XML 형식 응답 처리
+            Document doc = DocumentBuilderFactory.newInstance()
+                    .newDocumentBuilder().parse(is);
+            doc.getDocumentElement().normalize();
 
-        // 2) 이 노선(lineNum)에 대한 그래프 구성 (BFS 용)
-        Map<String, List<String>> graph = subwayGraphService.buildGraph(lineNum);
-
-        // 3) 이번 동기화에서 발견된 trainNo를 추적하기 위한 Set
-        Set<String> fetchedTrainNos = new HashSet<>();
-
-        // 4) API 응답(rowList) 순회 후, DB Insert/Update
-        for (int i = 0; i < rowList.getLength(); i++) {
-            Node row = rowList.item(i);
-            if (row.getNodeType() != Node.ELEMENT_NODE) {
-                continue;
-            }
-            Element element = (Element) row;
-
-            // 열차번호
-            String trainNo  = getTagValue(element, "trainNo");
-            // 상/하행
-            String upDown   = getTagValue(element, "updnLine");
-            // 막차 여부 (예시)
-            String expressYn= getTagValue(element, "expressyn");
-            // 현재역
-            String currStatn= getTagValue(element, "statnNm");
-            // 종착역
-            String endStatn = getTagValue(element, "statnTnm");
-
-            // 필수 정보 누락 시 스킵
-            if (trainNo == null || currStatn == null || endStatn == null) {
-                log.warn("Skipping row due to null values: trainNo={}, currStatn={}, endStatn={}",
-                        trainNo, currStatn, endStatn);
-                continue;
-            }
-
-            // 새로 발견된 trainNo 기록
-            fetchedTrainNos.add(trainNo);
-
-            // DB에서 trainNo 존재 여부 확인
-            Optional<TrainInfo> optTrain = trainInfoRepository.findByTrainNo(trainNo);
-            TrainInfo train;
-            if (optTrain.isEmpty()) {
-                // --- [새 열차] ---
-                train = new TrainInfo();
-                train.setTrainNo(trainNo);
-                train.setUpDown(upDown);
-                train.setExpressYn(expressYn);
-                train.setCurrentStation(currStatn);
-                train.setEndStation(endStatn);
-                // [추가] 호선 저장
-                train.setLineNum(lineNum);
-
-                // BFS로 현재역~종착역 사이 경로 계산
-                List<String> path = subwayGraphService.bfsPath(graph, currStatn, endStatn);
-                log.debug("[NEW TRAIN] BFS path: {}", path);
-
-                // path를 JSON 문자열로 변환해서 저장
-                train.setStationsJson(toJsonString(path));
-                train.setUpdateTime(LocalDateTime.now());
-                trainInfoRepository.save(train);
-
-                log.info("[NEW TRAIN] {} - {} ( {} -> {} )", trainNo, lineNum, currStatn, endStatn);
-
-            } else {
-                // --- [기존 열차 업데이트] ---
-                train = optTrain.get();
-                train.setUpDown(upDown);
-                train.setExpressYn(expressYn);
-                train.setCurrentStation(currStatn);
-                train.setEndStation(endStatn);
-                train.setLineNum(lineNum);
-
-                // 기존에 저장된 JSON 경로에서 "이미 지난 역"을 제거하는 로직
-                List<String> path = fromJsonString(train.getStationsJson());
-                if (path != null && !path.isEmpty()) {
-                    int currIdx = path.indexOf(currStatn);
-                    // 현재역보다 앞에 있는 역들은 지난 것으로 보고 제거
-                    if (currIdx > 0) {
-                        for (int idx = 0; idx < currIdx; idx++) {
-                            path.set(idx, null);
-                        }
-                        path.removeIf(Objects::isNull);
+            // <code> 태그를 통해 오류 코드 확인
+            NodeList codeNodes = doc.getElementsByTagName("code");
+            if (codeNodes != null && codeNodes.getLength() > 0) {
+                String errorCode = codeNodes.item(0).getTextContent();
+                if ("ERROR-337".equals(errorCode)) {
+                    if (this.apiKey.equals("755455636167793236306850475a51")) {
+                        this.apiKey = "51434941476779323635637044786e";
+                    } else if (this.apiKey.equals("51434941476779323635637044786e")) {
+                        this.apiKey = "4f6b52794467793236325572567469";
                     }
-                    train.setStationsJson(toJsonString(path));
+                    log.warn("[ERROR] {}: 응답 오류 코드 {} 발견 (API 키를 새 값으로 교체함)", lineNum, errorCode);
+                    return;
+                }
+            }
+
+            // 정상적인 XML 응답인 경우, 기존 로직대로 열차 정보를 처리합니다.
+            NodeList rowList = doc.getElementsByTagName("row");
+            if (rowList.getLength() == 0) {
+                log.info("[INFO] {}: 열차 정보가 없습니다.", lineNum);
+                return;
+            }
+
+            // 일반 노선용 그래프만 생성 (급행 여부와 무관하게 동일한 경로 탐색)
+            Map<String, List<String>> graph = subwayGraphService.buildGraph(lineNum, false);
+
+            // 이번 동기화에서 발견된 trainNo 추적
+            Set<String> fetchedTrainNos = new HashSet<>();
+
+            for (int i = 0; i < rowList.getLength(); i++) {
+                Node row = rowList.item(i);
+                if (row.getNodeType() != Node.ELEMENT_NODE) {
+                    continue;
+                }
+                Element element = (Element) row;
+
+                // API의 각 필드 값 추출
+                String subwayId      = getTagValue(element, "subwayId");
+                String statnId       = getTagValue(element, "statnId");
+                String trainNo       = getTagValue(element, "trainNo");
+                String lastRecptnDt  = getTagValue(element, "lastRecptnDt");
+                String recptnDt      = getTagValue(element, "recptnDt");
+                String upDown        = getTagValue(element, "updnLine");
+                String statnTid      = getTagValue(element, "statnTid");
+                String rawCurrStatn  = getTagValue(element, "statnNm");
+                String rawEndStatn   = getTagValue(element, "statnTnm");
+                String trainSttus    = getTagValue(element, "trainSttus");
+                String directAt      = getTagValue(element, "directAt");
+                String lstcarAt      = getTagValue(element, "lstcarAt");
+
+                // 현재역 및 종착역의 소괄호와 그 안의 내용 제거
+                String currStatn = removeParentheses(rawCurrStatn);
+                String endStatn  = removeParentheses(rawEndStatn);
+
+                if (trainNo == null || currStatn == null || endStatn == null) {
+                    log.warn("Skipping row due to null values: trainNo={}, currStatn={}, endStatn={}",
+                            trainNo, currStatn, endStatn);
+                    continue;
                 }
 
-                train.setUpdateTime(LocalDateTime.now());
-                trainInfoRepository.save(train);
+                fetchedTrainNos.add(trainNo);
 
-                log.info("[UPDATE TRAIN] {} - {} (현재역: {})", trainNo, lineNum, currStatn);
-            }
-        }
+                Optional<TrainInfo> optTrain = trainInfoRepository.findByTrainNo(trainNo);
+                TrainInfo train;
+                if (optTrain.isEmpty()) {
+                    // --- [새 열차 추가] ---
+                    train = new TrainInfo();
+                    train.setSubwayId(subwayId);
+                    train.setStatnId(statnId);
+                    train.setTrainNo(trainNo);
+                    train.setLastRecptnDt(lastRecptnDt);
+                    train.setRecptnDt(recptnDt);
+                    train.setUpDown(upDown);
+                    train.setTrainSttus(trainSttus);
+                    train.setDirectAt(directAt);
+                    train.setLstcarAt(lstcarAt);
+                    train.setCurrentStation(currStatn);
+                    train.setStatnTid(statnTid);
+                    train.setEndStation(endStatn);
+                    train.setLineNum(lineNum);
 
-        // 5) === [사라진 열차] 정리 로직 ===
-        //    이번 동기화에서 발견되지 않은(= fetchedTrainNos에 없는) 열차를 DB에서 삭제
-        List<TrainInfo> existingTrains = trainInfoRepository.findByLineNum(lineNum);
-        for (TrainInfo t : existingTrains) {
-            // 해당 lineNum에 속하지만, 이번 동기화에서 발견되지 않은 trainNo
-            if (!fetchedTrainNos.contains(t.getTrainNo())) {
-                // 운행 종료된 것으로 판단하여 DB에서 제거
-                trainInfoRepository.delete(t);
-                log.info("[DELETE TRAIN] {} - {} (운행 종료)", t.getTrainNo(), lineNum);
+                    // BFS를 통해 현재역 ~ 종착역 경로 계산 (항상 일반 열차용 graph 사용)
+                    List<String> path = subwayGraphService.bfsPath(graph, currStatn, endStatn);
+                    log.debug("[NEW TRAIN] BFS path: {}", path);
+
+                    train.setStationsJson(toJsonString(path));
+                    train.setUpdateTime(LocalDateTime.now());
+                    trainInfoRepository.save(train);
+
+                    log.info("[NEW TRAIN] {} - {} ( {} -> {} )", trainNo, lineNum, currStatn, endStatn);
+                    // log.json에 신규 열차 추가 이벤트 기록
+                    logTrainEvent("NEW_TRAIN", train);
+
+                } else {
+                    // --- [기존 열차 업데이트] ---
+                    train = optTrain.get();
+                    train.setSubwayId(subwayId);
+                    train.setStatnId(statnId);
+                    train.setTrainNo(trainNo);
+                    train.setLastRecptnDt(lastRecptnDt);
+                    train.setRecptnDt(recptnDt);
+                    train.setUpDown(upDown);
+                    train.setTrainSttus(trainSttus);
+                    train.setDirectAt(directAt);
+                    train.setLstcarAt(lstcarAt);
+                    train.setCurrentStation(currStatn);
+                    train.setStatnTid(statnTid);
+                    train.setEndStation(endStatn);
+                    train.setLineNum(lineNum);
+
+                    List<String> path = fromJsonString(train.getStationsJson());
+                    if (path != null && !path.isEmpty()) {
+                        int currIdx = path.indexOf(currStatn);
+                        if (currIdx > 0) {
+                            for (int idx = 0; idx < currIdx; idx++) {
+                                path.set(idx, null);
+                            }
+                            path.removeIf(Objects::isNull);
+                        }
+                        train.setStationsJson(toJsonString(path));
+                    }
+                    train.setUpdateTime(LocalDateTime.now());
+                    trainInfoRepository.save(train);
+
+                    log.info("[UPDATE TRAIN] {} - {} (현재역: {})", trainNo, lineNum, currStatn);
+                    // log.json에 업데이트 이벤트 기록
+                    logTrainEvent("UPDATE_TRAIN", train);
+                }
             }
+
+
+// 삭제 이벤트 처리 (삭제되는 열차에 대해 log.json에도 기록)
+            List<TrainInfo> existingTrains = trainInfoRepository.findByLineNum(lineNum);
+            for (TrainInfo t : existingTrains) {
+                if (!fetchedTrainNos.contains(t.getTrainNo())) {
+                    trainInfoRepository.delete(t);
+                    log.info("[DELETE TRAIN] {} - {} (운행 종료)", t.getTrainNo(), lineNum);
+                    // 삭제 이벤트도 log.json에 기록
+                    logTrainEvent("DELETE_TRAIN", t);
+                }
+            }
+
         }
     }
 
-    /**
-     * XML Element에서 특정 tag 텍스트 값을 추출하는 헬퍼 메서드
-     */
     private String getTagValue(Element element, String tag) {
         NodeList list = element.getElementsByTagName(tag);
         if (list.getLength() == 0) {
@@ -181,20 +262,11 @@ public class SubwaySyncService {
         return list.item(0).getTextContent();
     }
 
-    /**
-     * List<String> -> JSON 문자열 변환 (간단 버전)
-     * 예: ["서울역","시청역","종각역"]
-     */
     private String toJsonString(List<String> list) {
         if (list == null) return "[]";
-        return "[" + String.join(",",
-                list.stream().map(s -> "\"" + s + "\"").toList()
-        ) + "]";
+        return "[" + String.join(",", list.stream().map(s -> "\"" + s + "\"").toList()) + "]";
     }
 
-    /**
-     * JSON 문자열 -> List<String> 변환 (간단 버전)
-     */
     private List<String> fromJsonString(String json) {
         if (json == null || json.isBlank()) {
             return new ArrayList<>();
@@ -214,5 +286,51 @@ public class SubwaySyncService {
             return result;
         }
         return new ArrayList<>();
+    }
+
+    private String removeParentheses(String input) {
+        if (input == null) {
+            return null;
+        }
+        return input.replaceAll("\\(.*?\\)", "").trim();
+    }
+
+    /**
+     * 새로운 열차 추가 혹은 기존 열차 업데이트 이벤트를 log.json 파일에 기록합니다.
+     * 각 기록에는 timestamp, action, trainNo, lineNum, currentStation, endStation 등의 정보가 포함됩니다.
+     */
+    private void logTrainEvent(String action, TrainInfo train) {
+        ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
+        List<Map<String, Object>> logList = new ArrayList<>();
+        File file = new File(LOG_FILE);
+
+        // 기존 log.json 파일이 존재하면 내용을 불러옵니다.
+        if (file.exists()) {
+            try {
+                logList = mapper.readValue(file, new TypeReference<List<Map<String, Object>>>() {});
+            } catch (IOException e) {
+                log.error("log.json 파일 읽기 실패: {}", e.getMessage(), e);
+            }
+        }
+
+        // 새 로그 기록 생성
+        Map<String, Object> record = new HashMap<>();
+        record.put("timestamp", LocalDateTime.now().toString());
+        record.put("action", action);
+        record.put("trainNo", train.getTrainNo());
+        record.put("lineNum", train.getLineNum());
+        record.put("currentStation", train.getCurrentStation());
+        record.put("endStation", train.getEndStation());
+        record.put("upDown", train.getUpDown());
+        record.put("express", train.getDirectAt());
+        logList.add(record);
+
+        // log.json 파일에 기록 저장
+        try {
+            mapper.writeValue(file, logList);
+            log.info("log.json 파일에 {} 이벤트 기록 완료: {}", action, record);
+        } catch (IOException e) {
+            log.error("log.json 파일 쓰기 실패: {}", e.getMessage(), e);
+        }
     }
 }
