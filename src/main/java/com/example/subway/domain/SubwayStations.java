@@ -11,7 +11,7 @@ import lombok.Setter;
 public class SubwayStations {
 
     @Id
-    private String stationcode; //역 코드 id
+    private String stationcode; //역 코드 idd
 
     private String stationname; //역 이름
     private String stationeng; //역 이름 영문
