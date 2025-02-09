@@ -26,6 +26,7 @@ public class SubwaySyncService {
 
     private final TrainInfoRepository trainInfoRepository;
     private final SubwayGraphService subwayGraphService;
+    private final NotificationService notificationService;
 
     // 최초 API 키
     private String apiKey = "755455636167793236306850475a51";
@@ -36,9 +37,11 @@ public class SubwaySyncService {
     private static final String LOG_FILE = "log.json";
 
     public SubwaySyncService(TrainInfoRepository trainInfoRepository,
-                             SubwayGraphService subwayGraphService) {
+                             SubwayGraphService subwayGraphService,
+                             NotificationService notificationService) {
         this.trainInfoRepository = trainInfoRepository;
         this.subwayGraphService  = subwayGraphService;
+        this.notificationService = notificationService;
     }
 
     /**
@@ -78,7 +81,6 @@ public class SubwaySyncService {
      * 특정 호선(lineNameEncoded, lineNum)에 대한 열차정보 동기화 및 DB 정리 로직
      */
     private void syncLine(String lineNameEncoded, String lineNum) throws Exception {
-        // 인스턴스 변수 apiKey 사용
         String apiUrl = String.format(SUBWAY_API_URL, apiKey, lineNameEncoded);
         log.info("[SYNC] {}: API 호출 URL = {}", lineNum, apiUrl);
 
@@ -87,13 +89,11 @@ public class SubwaySyncService {
         String contentType = connection.getContentType();
         InputStream is = connection.getInputStream();
 
-        // JSON 형식 응답 처리
         if (contentType != null && contentType.contains("application/json")) {
             String jsonResponse = new String(is.readAllBytes(), StandardCharsets.UTF_8);
             ObjectMapper mapper = new ObjectMapper();
             Map<String, Object> responseMap = mapper.readValue(jsonResponse, new TypeReference<Map<String, Object>>() {});
             if ("ERROR-337".equals(responseMap.get("code"))) {
-                // 현재 사용중인 API 키에 따라 순차적으로 교체
                 if (this.apiKey.equals("755455636167793236306850475a51")) {
                     this.apiKey = "51434941476779323635637044786e";
                 } else if (this.apiKey.equals("51434941476779323635637044786e")) {
@@ -105,12 +105,10 @@ public class SubwaySyncService {
             log.info("[INFO] {}: JSON 응답 수신: {}", lineNum, jsonResponse);
             return;
         } else {
-            // XML 형식 응답 처리
             Document doc = DocumentBuilderFactory.newInstance()
                     .newDocumentBuilder().parse(is);
             doc.getDocumentElement().normalize();
 
-            // <code> 태그를 통해 오류 코드 확인
             NodeList codeNodes = doc.getElementsByTagName("code");
             if (codeNodes != null && codeNodes.getLength() > 0) {
                 String errorCode = codeNodes.item(0).getTextContent();
@@ -125,17 +123,13 @@ public class SubwaySyncService {
                 }
             }
 
-            // 정상적인 XML 응답인 경우, 기존 로직대로 열차 정보를 처리합니다.
             NodeList rowList = doc.getElementsByTagName("row");
             if (rowList.getLength() == 0) {
                 log.info("[INFO] {}: 열차 정보가 없습니다.", lineNum);
                 return;
             }
 
-            // 일반 노선용 그래프만 생성 (급행 여부와 무관하게 동일한 경로 탐색)
             Map<String, List<String>> graph = subwayGraphService.buildGraph(lineNum, false);
-
-            // 이번 동기화에서 발견된 trainNo 추적
             Set<String> fetchedTrainNos = new HashSet<>();
 
             for (int i = 0; i < rowList.getLength(); i++) {
@@ -145,7 +139,6 @@ public class SubwaySyncService {
                 }
                 Element element = (Element) row;
 
-                // API의 각 필드 값 추출
                 String subwayId      = getTagValue(element, "subwayId");
                 String statnId       = getTagValue(element, "statnId");
                 String trainNo       = getTagValue(element, "trainNo");
@@ -159,7 +152,6 @@ public class SubwaySyncService {
                 String directAt      = getTagValue(element, "directAt");
                 String lstcarAt      = getTagValue(element, "lstcarAt");
 
-                // 현재역 및 종착역의 소괄호와 그 안의 내용 제거
                 String currStatn = removeParentheses(rawCurrStatn);
                 String endStatn  = removeParentheses(rawEndStatn);
 
@@ -190,7 +182,6 @@ public class SubwaySyncService {
                     train.setEndStation(endStatn);
                     train.setLineNum(lineNum);
 
-                    // BFS를 통해 현재역 ~ 종착역 경로 계산 (항상 일반 열차용 graph 사용)
                     List<String> path = subwayGraphService.bfsPath(graph, currStatn, endStatn);
                     log.debug("[NEW TRAIN] BFS path: {}", path);
 
@@ -199,9 +190,10 @@ public class SubwaySyncService {
                     trainInfoRepository.save(train);
 
                     log.info("[NEW TRAIN] {} - {} ( {} -> {} )", trainNo, lineNum, currStatn, endStatn);
-                    // log.json에 신규 열차 추가 이벤트 기록
                     logTrainEvent("NEW_TRAIN", train);
 
+                    // 막차 알림 체크 (신규 열차)
+                    notificationService.checkAndSendAlerts(train);
                 } else {
                     // --- [기존 열차 업데이트] ---
                     train = optTrain.get();
@@ -234,23 +226,22 @@ public class SubwaySyncService {
                     trainInfoRepository.save(train);
 
                     log.info("[UPDATE TRAIN] {} - {} (현재역: {})", trainNo, lineNum, currStatn);
-                    // log.json에 업데이트 이벤트 기록
                     logTrainEvent("UPDATE_TRAIN", train);
+
+                    // 막차 알림 체크 (업데이트 열차)
+                    notificationService.checkAndSendAlerts(train);
                 }
             }
 
-
-// 삭제 이벤트 처리 (삭제되는 열차에 대해 log.json에도 기록)
+            // 삭제 이벤트 처리
             List<TrainInfo> existingTrains = trainInfoRepository.findByLineNum(lineNum);
             for (TrainInfo t : existingTrains) {
                 if (!fetchedTrainNos.contains(t.getTrainNo())) {
                     trainInfoRepository.delete(t);
                     log.info("[DELETE TRAIN] {} - {} (운행 종료)", t.getTrainNo(), lineNum);
-                    // 삭제 이벤트도 log.json에 기록
                     logTrainEvent("DELETE_TRAIN", t);
                 }
             }
-
         }
     }
 
@@ -295,16 +286,11 @@ public class SubwaySyncService {
         return input.replaceAll("\\(.*?\\)", "").trim();
     }
 
-    /**
-     * 새로운 열차 추가 혹은 기존 열차 업데이트 이벤트를 log.json 파일에 기록합니다.
-     * 각 기록에는 timestamp, action, trainNo, lineNum, currentStation, endStation 등의 정보가 포함됩니다.
-     */
     private void logTrainEvent(String action, TrainInfo train) {
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
         List<Map<String, Object>> logList = new ArrayList<>();
         File file = new File(LOG_FILE);
 
-        // 기존 log.json 파일이 존재하면 내용을 불러옵니다.
         if (file.exists()) {
             try {
                 logList = mapper.readValue(file, new TypeReference<List<Map<String, Object>>>() {});
@@ -313,7 +299,6 @@ public class SubwaySyncService {
             }
         }
 
-        // 새 로그 기록 생성
         Map<String, Object> record = new HashMap<>();
         record.put("timestamp", LocalDateTime.now().toString());
         record.put("action", action);
@@ -325,7 +310,6 @@ public class SubwaySyncService {
         record.put("express", train.getDirectAt());
         logList.add(record);
 
-        // log.json 파일에 기록 저장
         try {
             mapper.writeValue(file, logList);
             log.info("log.json 파일에 {} 이벤트 기록 완료: {}", action, record);
